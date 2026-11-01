@@ -1,0 +1,4 @@
+#%PAM-1.0
+# PAM configuration for afprustd (AFP file server for classic Mac OS).
+@include common-auth
+@include common-account

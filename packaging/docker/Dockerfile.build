@@ -1,0 +1,8 @@
+# Build environment matching Raspberry Pi OS Bookworm (Debian 12, arm64).
+#   docker build -f packaging/docker/Dockerfile.build -t afprust-build .
+FROM rust:1-bookworm
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpam0g-dev pamtester attr \
+ && rm -rf /var/lib/apt/lists/* \
+ && cargo install cargo-deb --locked
+WORKDIR /src

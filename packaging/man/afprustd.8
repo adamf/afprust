@@ -1,0 +1,93 @@
+.TH AFPRUSTD 8 "November 2026" "afprust 0.1.0" "System Administration"
+.SH NAME
+afprustd \- AFP 2.2 (AppleShare over TCP/IP) file server for classic Mac OS
+.SH SYNOPSIS
+.B afprustd
+.RB [ \-F
+.IR config ]
+.RB [ \-t ]
+.RB [ \-v ]
+.RB [ \-V ]
+.SH DESCRIPTION
+.B afprustd
+serves files to Mac OS 8 and 9 (AppleShare Client 3.7 and later) using the
+Apple Filing Protocol version 2.2 over TCP/IP. It reads netatalk 3/4
+.I afp.conf
+files and netatalk 2
+.I afpd.conf
+/
+.I AppleVolumes.default
+files, and stores Finder information, comments and resource forks in the
+same places as netatalk, so volumes can be shared with netatalk and
+Mac OS X clients.
+.PP
+The master process accepts connections and starts one process per client.
+Each session process authenticates the user through PAM (service
+.IR afprust )
+and then permanently switches to that user's uid and groups before it
+accesses any volume. All volume access is confined to the volume by the
+kernel (openat2 RESOLVE_BENEATH).
+.PP
+With
+.B appletalk = yes
+a small helper process gives the Ethernet interface an AppleTalk address and
+answers Chooser lookups, so the server appears in the Mac OS Chooser. Macs
+then connect over TCP/IP.
+.SH OPTIONS
+.TP
+.BI \-F " config"
+Use this configuration file. Without it, afprustd uses the first that
+exists of
+.IR /etc/afprust/afp.conf ,
+.IR /etc/netatalk/afp.conf ,
+and the netatalk 2 files
+.IR /etc/netatalk/afpd.conf " and " /etc/netatalk/AppleVolumes.default .
+A path ending in
+.I afpd.conf
+selects the netatalk 2 format.
+.TP
+.B \-t
+Check the configuration, print a summary including ignored options, and exit.
+.TP
+.B \-v
+Log debug messages.
+.TP
+.B \-d
+Accepted for netatalk compatibility; afprustd always runs in the foreground.
+.TP
+.B \-V
+Print the version.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload the configuration. New sessions use the new settings.
+.TP
+.B SIGTERM
+Notify connected clients that the server is shutting down and exit.
+.SH FILES
+.TP
+.I /etc/afprust/afp.conf
+Main configuration.
+.TP
+.I /etc/afprust/extmap.conf
+File extension to type/creator mapping.
+.TP
+.I /etc/pam.d/afprust
+PAM configuration.
+.TP
+.I /etc/default/afprustd
+Extra command line options for the systemd service.
+.TP
+.I /var/lib/afprust/afp_signature
+Server signature (identifies this server to clients).
+.SH SECURITY
+DHCAST128 is the strongest authentication classic Mac OS supports; its
+128-bit Diffie-Hellman group is weak by modern standards. Cleartext
+authentication sends passwords unencrypted. Use the server on trusted
+networks only. Logins as root are refused. Repeated failed logins from one
+address block it for 15 minutes.
+.SH SEE ALSO
+.BR afp.conf (5)
+from netatalk,
+.BR systemctl (1),
+.BR pam (8)

@@ -1,0 +1,4 @@
+# Extra options for afprustd (see afprustd(8)).
+# To serve an existing netatalk configuration instead of /etc/afprust/afp.conf:
+#AFPRUSTD_OPTS="-F /etc/netatalk/afp.conf"
+AFPRUSTD_OPTS=""

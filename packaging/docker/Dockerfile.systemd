@@ -1,0 +1,7 @@
+# Debian 12 with systemd as PID 1, for testing the packaged service.
+FROM debian:bookworm
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends systemd systemd-sysv libpam-modules procps attr \
+ && rm -rf /var/lib/apt/lists/*
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

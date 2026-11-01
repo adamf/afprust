@@ -1,0 +1,55 @@
+[package]
+name = "afprust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/adamf/afprust"
+description = "AFP 2.2 file server for classic Mac OS clients, compatible with netatalk configuration"
+publish = false
+
+[lib]
+name = "afprust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "afprustd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+log = { version = "0.4", features = ["std"] }
+getrandom = "0.2"
+cast5 = "0.11"
+des = "0.8"
+unicode-normalization = "0.1"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = true
+
+[package.metadata.deb]
+name = "afprust"
+maintainer = "Adam Fletcher <adam@return.dev>"
+section = "net"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+afprustd serves files over AFP 2.2 (AppleShare over TCP/IP) to classic Mac OS \
+clients such as Mac OS 8 and 9. It reads netatalk-style afp.conf files and \
+stores Mac metadata in netatalk-compatible extended attributes."""
+conf-files = ["/etc/afprust/afp.conf", "/etc/afprust/extmap.conf", "/etc/pam.d/afprust", "/etc/default/afprustd"]
+maintainer-scripts = "packaging/debian/"
+systemd-units = { unit-name = "afprustd", unit-scripts = "packaging/systemd", enable = true, start = true }
+assets = [
+    ["target/release/afprustd", "usr/sbin/", "755"],
+    ["packaging/afp.conf", "etc/afprust/afp.conf", "644"],
+    ["packaging/extmap.conf", "etc/afprust/extmap.conf", "644"],
+    ["packaging/pam.d/afprust", "etc/pam.d/afprust", "644"],
+    ["packaging/default-afprustd", "etc/default/afprustd", "644"],
+    ["packaging/man/afprustd.8", "usr/share/man/man8/afprustd.8", "644"],
+    ["README.md", "usr/share/doc/afprust/README.md", "644"],
+]
