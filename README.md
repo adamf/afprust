@@ -118,30 +118,19 @@ Pi takes a node address in the startup range and appears as
 `<server name>:AFPServer@*`. AFP itself always runs over TCP/IP; Macs
 without TCP/IP configured cannot connect.
 
-## Configuration reference
+## Configuration
 
-All netatalk 3/4 option names are accepted. These have an effect:
+See **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** for every option,
+recipes (sharing a folder, group shares, guest access, AppleTalk), metadata
+storage, file names, migrating from netatalk, and troubleshooting.
 
-**[Global]**: `server name`, `hostname`, `afp listen`, `afp port`,
-`uam list`, `guest account`, `login message`, `save password`,
-`max connections`, `tickleval`, `timeout`, `server quantum`, `log level`,
-`log file`, `signature`, `extmap file`, `mac charset` (MAC_ROMAN only),
-`appletalk`, `ddp address`, `ddp zone`, `vol preset`, and any volume option
-(as a default for all volumes).
+A minimal volume:
 
-**Volumes** (any section with `path`; `[Homes]` uses `basedir regex`,
-`home name` and an optional `path` below the home directory):
-`path`, `volume name`, `valid users`, `invalid users`, `rolist`, `rwlist`,
-`read only`, `password`, `appledouble`, `ea`, `file perm`,
-`directory perm`, `umask`, `invisible dots`, `follow symlinks`,
-`veto files`, `delete veto files`, `hosts allow`, `hosts deny`,
-`vol size limit`, `legacy volume size`, `vol preset`.
-Variables `$u $g $f $h $s $i $c $v $d $b $$` work as in netatalk.
-
-**afprust additions**: `pam service` (default `afprust`),
-`max connections per ip` (default 16), `login timeout` (seconds to complete
-login, default 60), `state directory` (default `/var/lib/afprust`),
-`ddp interface`.
+```ini
+[OS 9]
+path = /srv/os9
+valid users = @macusers
+```
 
 ## Security
 

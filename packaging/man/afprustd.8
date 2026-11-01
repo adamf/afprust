@@ -1,4 +1,4 @@
-.TH AFPRUSTD 8 "November 2026" "afprust 0.1.0" "System Administration"
+.TH AFPRUSTD 8 "November 2026" "afprust 0.1.1" "System Administration"
 .SH NAME
 afprustd \- AFP 2.2 (AppleShare over TCP/IP) file server for classic Mac OS
 .SH SYNOPSIS
@@ -86,6 +86,10 @@ DHCAST128 is the strongest authentication classic Mac OS supports; its
 authentication sends passwords unencrypted. Use the server on trusted
 networks only. Logins as root are refused. Repeated failed logins from one
 address block it for 15 minutes.
+.PP
+The configuration options are documented in
+.I /usr/share/doc/afprust/CONFIGURATION.md
+and at https://github.com/adamf/afprust/blob/main/docs/CONFIGURATION.md
 .SH SEE ALSO
 .BR afp.conf (5)
 from netatalk,

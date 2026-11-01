@@ -133,10 +133,66 @@ pub fn sd_notify(msg: &str) {
     }
 }
 
+/// Bind a TCP listener. IPv6 sockets are made IPv6-only when IPv4
+/// addresses are listed too (`afp listen = 0.0.0.0 ::`); a lone `::` keeps
+/// the Linux default and also accepts IPv4 connections.
+fn bind_one(a: &SocketAddr, v6only: bool) -> io::Result<TcpListener> {
+    use std::os::fd::FromRawFd;
+    let (family, v6) = match a {
+        SocketAddr::V4(_) => (libc::AF_INET, false),
+        SocketAddr::V6(_) => (libc::AF_INET6, true),
+    };
+    // SAFETY: plain socket calls; the descriptor is owned by the listener
+    // on success and closed on every error path.
+    unsafe {
+        let fd = libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fail = |fd: libc::c_int| {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            Err(e)
+        };
+        let on: libc::c_int = 1;
+        let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &on as *const _ as *const libc::c_void, sz) != 0 {
+            return fail(fd);
+        }
+        if v6 && v6only
+            && libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &on as *const _ as *const libc::c_void, sz) != 0
+        {
+            return fail(fd);
+        }
+        let r = match a {
+            SocketAddr::V4(v4) => {
+                let mut sin: libc::sockaddr_in = std::mem::zeroed();
+                sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                sin.sin_port = v4.port().to_be();
+                sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                libc::bind(fd, &sin as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+            }
+            SocketAddr::V6(v6a) => {
+                let mut sin6: libc::sockaddr_in6 = std::mem::zeroed();
+                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sin6.sin6_port = v6a.port().to_be();
+                sin6.sin6_addr.s6_addr = v6a.ip().octets();
+                sin6.sin6_scope_id = v6a.scope_id();
+                libc::bind(fd, &sin6 as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+            }
+        };
+        if r != 0 || libc::listen(fd, 128) != 0 {
+            return fail(fd);
+        }
+        Ok(TcpListener::from_raw_fd(fd))
+    }
+}
+
 fn bind(addrs: &[SocketAddr]) -> io::Result<Vec<TcpListener>> {
     let mut out = Vec::new();
+    let any_v4 = addrs.iter().any(|a| a.is_ipv4());
     for a in addrs {
-        let l = TcpListener::bind(a).map_err(|e| io::Error::new(e.kind(), format!("cannot listen on {}: {}", a, e)))?;
+        let l = bind_one(a, any_v4).map_err(|e| io::Error::new(e.kind(), format!("cannot listen on {}: {}", a, e)))?;
         l.set_nonblocking(true)?;
         signals::set_cloexec_nonblock(l.as_raw_fd());
         log::info!("listening on {}", a);
@@ -410,4 +466,31 @@ fn socket_keepalive(s: &TcpStream) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_on_ipv4_and_ipv6_wildcards() {
+        // Find a free port, then bind both wildcards on it, as
+        // "afp listen = 0.0.0.0 ::" does.
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let v4 = SocketAddr::from(([0, 0, 0, 0], port));
+        let v6: SocketAddr = format!("[::]:{}", port).parse().unwrap();
+        if TcpListener::bind("[::1]:0").is_err() {
+            eprintln!("no IPv6 here, skipping");
+            return;
+        }
+        let ls = bind(&[v4, v6]).expect("both wildcards bind");
+        assert_eq!(ls.len(), 2);
+        drop(ls);
+        // a lone "::" accepts IPv4 connections too
+        let ls = bind(&[v6]).unwrap();
+        ls[0].set_nonblocking(false).unwrap();
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("IPv4 via dual-stack ::");
+    }
 }

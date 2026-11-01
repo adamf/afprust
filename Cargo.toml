@@ -1,6 +1,6 @@
 [package]
 name = "afprust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/adamf/afprust"
@@ -54,4 +54,5 @@ assets = [
     ["packaging/default-afprustd", "etc/default/afprustd", "644"],
     ["packaging/man/afprustd.8", "usr/share/man/man8/afprustd.8", "644"],
     ["README.md", "usr/share/doc/afprust/README.md", "644"],
+    ["docs/CONFIGURATION.md", "usr/share/doc/afprust/CONFIGURATION.md", "644"],
 ]
