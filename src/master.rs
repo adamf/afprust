@@ -236,7 +236,8 @@ impl Master {
                 break;
             }
             if self.helper_pids.contains(&pid) {
-                log::warn!("helper process {} exited (status {})", pid, status);
+                // The AppleTalk helper logs its own reason before exiting.
+                log::info!("AppleTalk helper {} stopped; AFP over TCP/IP is unaffected", pid);
                 self.helper_pids.retain(|&p| p != pid);
                 continue;
             }

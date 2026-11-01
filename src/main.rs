@@ -121,8 +121,9 @@ fn main() -> ExitCode {
     if cfg.volumes.is_empty() && cfg.homes.is_none() {
         log::warn!("no volumes are configured");
     }
-    // Start the AppleTalk responder before binding any TCP listener so the
-    // helper process inherits no listening sockets.
+    // Start the AppleTalk helper before binding any TCP listener so it
+    // inherits no listening sockets. It sets AppleTalk up on its own,
+    // retrying while the interface is not ready yet.
     let mut helper = None;
     if cfg.global.appletalk.enabled {
         match atalk::spawn(&cfg.global.appletalk, &master::server_info(&cfg), &cfg.global.listen) {

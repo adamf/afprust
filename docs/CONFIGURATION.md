@@ -188,7 +188,7 @@ See [AppleTalk](#appletalk).
 | `extmap file` | `/etc/afprust/extmap.conf` | Extension → type/creator map. |
 | `mac charset` | `MAC_ROMAN` | Only MacRoman is supported. |
 | `appletalk` | `no` | Announce the server over AppleTalk. |
-| `ddp interface` | a bridge with ports, else `eth0` | Interface for AppleTalk; bridge ports are replaced by their bridge. *(afprust)* |
+| `ddp interface` | a bridge with ports, else `eth0` with a link | Interface for AppleTalk; bridge ports are replaced by their bridge. *(afprust)* |
 | `ddp address` | random | AppleTalk address as `net.node`, e.g. `65280.42`. |
 | `ddp zone` | none | AppleTalk zone to answer for. |
 | `vol preset` | none | Template section applied to every volume. |
@@ -331,9 +331,12 @@ uses TCP/IP, so the Mac needs TCP/IP configured as well. (AppleShare Client
   `lsmod | grep appletalk`.
 - `ddp interface` picks the interface. By default afprustd uses a bridge
   that has ports (`br0`, libvirt's `virbr0`) if there is one, otherwise
-  `eth0`. Wi-Fi is skipped by default because AppleTalk over Wi-Fi is
-  unreliable; set `ddp interface = wlan0` to try it. tap, veth and Docker
-  interfaces are never chosen.
+  `eth0`. Interfaces without a link (an unplugged `eth0`) are skipped;
+  bridges are exempt, because a bridge whose only port is a VM's tap has no
+  link until the VM runs. Wi-Fi is skipped by default because AppleTalk over
+  Wi-Fi is unreliable; set `ddp interface = wlan0` to try it. tap, veth and
+  Docker interfaces are never chosen. An interface named in `ddp interface`
+  is used even without a link, with a warning in the log.
 - An interface that is part of a bridge (or bond) cannot receive AppleTalk
   itself, because the kernel hands its traffic to the bridge. afprustd
   therefore always moves to the bridge, even when `ddp interface` names a
@@ -347,6 +350,9 @@ uses TCP/IP, so the Mac needs TCP/IP configured as well. (AppleShare Client
   listens only on that address). The list is
   refreshed every 10 seconds, so addresses obtained after start-up (DHCP)
   are picked up.
+- If the interface is not ready when afprustd starts (at boot, a bridge may
+  appear a moment later), the AppleTalk part retries every 5 seconds for up
+  to 5 minutes. AFP over TCP/IP is available meanwhile.
 - Designed for networks without an AppleTalk router (the usual home setup).
   If the interface already has an AppleTalk address, afprustd uses it, but
   netatalk's `atalkd` must not be running: it holds the name lookup (NBP)
@@ -356,19 +362,64 @@ uses TCP/IP, so the Mac needs TCP/IP configured as well. (AppleShare Client
 
 ### Mac OS 9 under QEMU
 
-A common setup runs Mac OS 9 in `qemu-system-ppc` on the same Pi or another
-Linux machine.
+A common setup runs Mac OS 9 in `qemu-system-ppc`, often on the Pi itself.
+How the virtual Mac reaches afprustd depends on QEMU's networking.
 
-- **Bridged networking** (a bridge such as `br0` holding `eth0` and the
-  VM's tap device, or libvirt's `virbr0`): the virtual Mac is on the same
-  Ethernet segment as the bridge. With `appletalk = yes`, afprustd runs
-  AppleTalk on the bridge automatically, so the server appears in the
-  virtual Mac's Chooser. Server IP Address works with the Pi's LAN address
-  as usual.
-- **User-mode networking** (`-netdev user`, QEMU's default): there is no
-  Ethernet segment, so AppleTalk cannot reach the virtual Mac. Use
-  **Server IP Address…** with `10.0.2.2`, QEMU's address for the host. This
-  only works when afprustd runs on the same machine as QEMU.
+**User-mode networking** (`-netdev user`, QEMU's default) is a NAT that only
+carries IP. **Server IP Address…** works, with the Pi's address or `10.0.2.2`
+(QEMU's name for the host). AppleTalk cannot pass through it, so the server
+never appears in the Chooser.
+
+**A host-only bridge** gives the virtual Mac a real Ethernet segment shared
+with the Pi. Then the Chooser lists the server too. A Wi-Fi interface cannot
+be bridged, so the bridge holds only the VM's tap device. NetworkManager's
+"shared" mode adds DHCP and NAT out through the Pi's normal connection, so
+the virtual Mac keeps its internet access. This is the setup confirmed
+working with Mac OS 9.2.1 under QEMU on a Raspberry Pi 5.
+
+1. Create the bridge and a tap device owned by the user who runs QEMU (here
+   `adamf`). Both persist across reboots:
+
+   ```sh
+   sudo nmcli con add type bridge ifname br0 con-name br0 bridge.stp no \
+       ipv4.method shared ipv4.addresses 10.99.0.1/24 ipv6.method disabled
+   sudo nmcli con add type tun ifname tap0 con-name tap0 mode tap owner $(id -u adamf) \
+       slave-type bridge master br0
+   sudo nmcli con up br0 && sudo nmcli con up tap0
+   ```
+
+   `ip -br addr show br0` shows `10.99.0.1/24` and state `DOWN` until QEMU
+   runs, which is normal. If activation complains about DHCP, install
+   `dnsmasq-base`.
+
+2. In the QEMU command line, attach the network card to the tap device:
+
+   ```sh
+   -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device sungem,netdev=net0
+   ```
+
+   Keep both parts on the same line. The warning `netdev net0 has no peer`
+   means the `-device` part is missing.
+
+3. In `/etc/afprust/afp.conf`:
+
+   ```ini
+   [Global]
+   appletalk = yes
+   ddp interface = br0
+   ```
+
+   Then run `sudo systemctl restart afprustd`. The log shows
+   `AppleTalk: br0 is …, registered <name>:AFPServer@*` and
+   `advertising TCP/IP address 10.99.0.1:548`.
+
+4. In Mac OS 9, set the TCP/IP control panel to Ethernet, using a DHCP
+   server (it gets a `10.99.0.x` address), and the AppleTalk control panel
+   to Ethernet. The server then appears under **Chooser → AppleShare**.
+   **Server IP Address…** with `10.99.0.1` works as well.
+
+If QEMU runs on another machine, bridge that machine's VM onto the LAN in the
+usual way, and connect the Pi's `eth0` to the same LAN.
 
 ## Mac metadata storage
 
@@ -488,5 +539,6 @@ every failing AFP command.
 | "You do not have enough access privileges" | Unix permissions of the folder for that user (`sudo -u <user> ls <path>`). Home directories are often 0700. |
 | Files show generic icons / open in the wrong app | Finder info is missing: add the extension to `extmap.conf`, or set type/creator from the Mac. |
 | The server is not in the Chooser | `appletalk = yes`, and did you `restart` (reload does not start AppleTalk)? Check `journalctl -u afprustd \| grep AppleTalk` for the interface and address, and `lsmod \| grep appletalk`. Is AppleTalk on Ethernet active on the Mac? With QEMU, see [Mac OS 9 under QEMU](#mac-os-9-under-qemu). Without AppleTalk, use **Server IP Address…**. |
+| Log says `AppleTalk: eth0 has no link` | The cable is unplugged, or the Pi uses Wi-Fi. For a virtual Mac, use a bridge (see [Mac OS 9 under QEMU](#mac-os-9-under-qemu)) and set `ddp interface = br0`. |
 | The server is in the Chooser but will not connect | The log line `AppleTalk: advertising TCP/IP address …` must show an address the Mac can reach. Set `afp listen = <address>` to choose it. |
 | Changes are not picked up | `sudo systemctl reload afprustd` (address changes need `restart`). Connected Macs keep their session's view until they reconnect. |

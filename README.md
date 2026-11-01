@@ -5,6 +5,10 @@ AFP 2.2 over TCP/IP (AppleShare IP), the protocol used by Mac OS 8.1–9.2.2
 (AppleShare Client 3.7 and later). It targets Linux, in particular a
 Raspberry Pi 5 running Raspberry Pi OS Bookworm, and runs as a systemd service.
 
+Confirmed working with **Mac OS 9.2.1** running under QEMU (`qemu-system-ppc`,
+`mac99`) on a Raspberry Pi 5, both via **Server IP Address** and with
+**AppleTalk** discovery in the Chooser.
+
 It reads **netatalk configuration files** (netatalk 3/4 `afp.conf`, and
 netatalk 2 `afpd.conf` + `AppleVolumes.default`) and stores Mac metadata the
 way netatalk does. You can point it at an existing netatalk setup and the
@@ -112,7 +116,8 @@ appletalk = yes
 
 afprustd picks the interface itself: a bridge if there is one (for example
 `br0` when Mac OS 9 runs under QEMU with bridged networking), otherwise
-`eth0`. The kernel module `appletalk` is loaded automatically when the
+`eth0` if it has a link. If the interface isn't ready at boot, AppleTalk
+retries for up to 5 minutes. The kernel module `appletalk` is loaded automatically when the
 server opens its first AppleTalk socket (check with `lsmod | grep
 appletalk`). The server assumes a network without an AppleTalk router (the
 usual home setup) and appears as `<server name>:AFPServer@*`. The Mac then

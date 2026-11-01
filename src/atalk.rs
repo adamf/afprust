@@ -83,7 +83,10 @@ mod imp {
         if fd < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EAFNOSUPPORT) {
-                return Err(io::Error::new(e.kind(), "kernel has no AppleTalk support (try: modprobe appletalk)"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "kernel has no AppleTalk support (try: sudo modprobe appletalk)",
+                ));
             }
             return Err(e);
         }
@@ -99,7 +102,15 @@ mod imp {
         Ok(r)
     }
 
-    fn pick_interface(cfg: &AppleTalkConfig) -> io::Result<String> {
+    /// The chosen AppleTalk interface, plus notes to log once setup works.
+    struct Pick {
+        name: String,
+        notes: Vec<String>,
+        /// Not a bridge and no link (cable unplugged?).
+        no_link: bool,
+    }
+
+    fn pick_interface(cfg: &AppleTalkConfig) -> io::Result<Pick> {
         pick_interface_in(Path::new("/sys/class/net"), cfg)
     }
 
@@ -110,17 +121,27 @@ mod imp {
             || ["docker", "br-", "veth", "tap", "vnet", "tun", "wg", "tailscale", "zt"].iter().any(|p| name.starts_with(p))
     }
 
+    fn has_link(dev: &Path) -> bool {
+        std::fs::read_to_string(dev.join("carrier")).map(|c| c.trim() == "1").unwrap_or(false)
+    }
+
     /// Choose the AppleTalk interface (sysfs root as a parameter for tests).
     ///
     /// A bridge port (or bond member) cannot receive AppleTalk itself: the
     /// kernel hands its frames to the bridge. This is the usual setup for
     /// Mac OS 9 under QEMU (br0 = eth0 + the VM's tap), so AppleTalk runs
     /// on the bridge, where both the LAN and the virtual Mac are reachable.
-    fn pick_interface_in(sys: &Path, cfg: &AppleTalkConfig) -> io::Result<String> {
+    ///
+    /// Automatic selection skips interfaces without a link (an unplugged
+    /// eth0 on a Pi that uses Wi-Fi). Bridges are exempt: a bridge whose
+    /// only port is a VM's tap has no link until the VM starts.
+    fn pick_interface_in(sys: &Path, cfg: &AppleTalkConfig) -> io::Result<Pick> {
+        let mut notes = Vec::new();
         let mut name = match &cfg.interface {
             Some(i) => i.clone(),
             None => {
                 let mut cands: Vec<(u8, String)> = Vec::new();
+                let mut unplugged: Vec<String> = Vec::new();
                 for e in std::fs::read_dir(sys)?.flatten() {
                     let n = e.file_name().to_string_lossy().into_owned();
                     let p = e.path();
@@ -129,6 +150,14 @@ mod imp {
                         continue;
                     }
                     let is_bridge = p.join("bridge").exists();
+                    // Ports are judged by their bridge, which is a candidate itself.
+                    if p.join("master").exists() {
+                        continue;
+                    }
+                    if !is_bridge && !has_link(&p) {
+                        unplugged.push(n);
+                        continue;
+                    }
                     let has_ports = std::fs::read_dir(p.join("brif")).map(|mut d| d.next().is_some()).unwrap_or(false);
                     let prio = if is_bridge && has_ports {
                         0
@@ -142,11 +171,18 @@ mod imp {
                     cands.push((prio, n));
                 }
                 cands.sort();
-                cands
-                    .into_iter()
-                    .next()
-                    .map(|(_, n)| n)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no wired Ethernet interface found; set 'ddp interface'"))?
+                match cands.into_iter().next() {
+                    Some((_, n)) => n,
+                    None => {
+                        unplugged.sort();
+                        let why = if unplugged.is_empty() {
+                            "no wired Ethernet interface or bridge found".to_string()
+                        } else {
+                            format!("no wired Ethernet interface with a link ({} has none)", unplugged.join(", "))
+                        };
+                        return Err(io::Error::new(io::ErrorKind::NotFound, format!("{}; set 'ddp interface'", why)));
+                    }
+                }
             }
         };
         // Climb from a bridge port / bond member to the device that
@@ -160,10 +196,12 @@ mod imp {
                 Some(m) => m.to_string_lossy().into_owned(),
                 None => break,
             };
-            log::info!("AppleTalk: {} is part of {}; using {} instead", name, m, m);
+            notes.push(format!("{} is part of {}; using {} instead", name, m, m));
             name = m;
         }
-        Ok(name)
+        let dev = sys.join(&name);
+        let no_link = !dev.join("bridge").exists() && !has_link(&dev);
+        Ok(Pick { name, notes, no_link })
     }
 
     fn random_u8() -> u8 {
@@ -539,8 +577,10 @@ mod imp {
         }
     }
 
-    pub fn spawn(cfg: &AppleTalkConfig, info: &ServerInfo, listen: &[SocketAddr]) -> io::Result<libc::pid_t> {
-        let ifname = pick_interface(cfg)?;
+    /// Bring AppleTalk up on the chosen interface and build the responder.
+    fn setup(cfg: &AppleTalkConfig, info: &ServerInfo, listen: &[SocketAddr]) -> io::Result<(Responder, StatusSource)> {
+        let pick = pick_interface(cfg)?;
+        let ifname = pick.name.clone();
         let ctl = ddp_socket()?;
         let (net, node) = configure(&ctl, &ifname, cfg)
             .map_err(|e| io::Error::new(e.kind(), format!("cannot configure AppleTalk on {}: {}", ifname, e)))?;
@@ -548,6 +588,16 @@ mod imp {
         bind(&nbp, net, node, NBP_SOCKET).map_err(|e| io::Error::new(e.kind(), format!("cannot bind NBP socket: {}", e)))?;
         let atp = ddp_socket()?;
         let atp_port = bind(&atp, net, node, 0)?;
+        drop(ctl);
+        for n in &pick.notes {
+            log::info!("AppleTalk: {}", n);
+        }
+        if pick.no_link {
+            log::warn!(
+                "AppleTalk: {} has no link (cable unplugged?); Macs will not see the server until it has one",
+                ifname
+            );
+        }
         log::info!(
             "AppleTalk: {} is {}.{}, registered {}:AFPServer@* on socket {}",
             ifname,
@@ -558,14 +608,14 @@ mod imp {
         );
         let mut src = StatusSource {
             info: info.clone(),
-            ifname: ifname.clone(),
+            ifname,
             listen: listen.to_vec(),
             ddp: NetAddr::Ddp { net, node, socket: atp_port },
             current: Vec::new(),
             refreshed: std::time::Instant::now(),
         };
         let status = src.build();
-        let mut responder = Responder {
+        let responder = Responder {
             nbp,
             atp,
             logic: Logic {
@@ -577,9 +627,55 @@ mod imp {
                 status,
             },
         };
-        drop(ctl);
-        // SAFETY: called from the single-threaded master before it starts
-        // serving.
+        Ok((responder, src))
+    }
+
+    const RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Set up AppleTalk, retrying for a while: at boot the interface (often
+    /// a bridge NetworkManager creates) may not exist yet.
+    fn setup_with_retry(cfg: &AppleTalkConfig, info: &ServerInfo, listen: &[SocketAddr]) -> (Responder, StatusSource) {
+        let deadline = std::time::Instant::now() + RETRY_FOR;
+        let mut warned = false;
+        loop {
+            match setup(cfg, info, listen) {
+                Ok(x) => return x,
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                    log::error!("AppleTalk disabled: {}", e);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        log::error!("AppleTalk disabled: {} (gave up after {} minutes)", e, RETRY_FOR.as_secs() / 60);
+                        std::process::exit(1);
+                    }
+                    if !warned {
+                        log::warn!(
+                            "AppleTalk is not ready yet: {}; retrying for up to {} minutes",
+                            e,
+                            RETRY_FOR.as_secs() / 60
+                        );
+                        warned = true;
+                    }
+                    let until = std::time::Instant::now() + RETRY_EVERY;
+                    while std::time::Instant::now() < until {
+                        if crate::signals::terminating() {
+                            std::process::exit(0);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start the AppleTalk helper process. It sets AppleTalk up itself
+    /// (retrying while the interface is not ready), then drops to
+    /// `nobody` and answers the Chooser.
+    pub fn spawn(cfg: &AppleTalkConfig, info: &ServerInfo, listen: &[SocketAddr]) -> io::Result<libc::pid_t> {
+        // SAFETY: called from the single-threaded master before it binds
+        // any listener or starts serving.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(io::Error::last_os_error());
@@ -588,6 +684,7 @@ mod imp {
             crate::signals::install_session();
             // Exit when the master goes away.
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+            let (mut responder, src) = setup_with_retry(cfg, info, listen);
             drop_to_nobody();
             responder.run(src);
         }
@@ -633,9 +730,14 @@ mod imp {
         }
 
         fn fake_if(sys: &Path, name: &str, bridge_ports: &[&str], wireless: bool) {
+            fake_if_link(sys, name, bridge_ports, wireless, true);
+        }
+
+        fn fake_if_link(sys: &Path, name: &str, bridge_ports: &[&str], wireless: bool, link: bool) {
             let d = sys.join(name);
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("type"), "1\n").unwrap();
+            std::fs::write(d.join("carrier"), if link { "1\n" } else { "0\n" }).unwrap();
             if wireless {
                 std::fs::create_dir_all(d.join("wireless")).unwrap();
             }
@@ -660,7 +762,7 @@ mod imp {
             fake_if(&s1, "eth0", &[], false);
             fake_if(&s1, "wlan0", &[], true);
             fake_if(&s1, "docker0", &[], false);
-            assert_eq!(pick_interface_in(&s1, &none).unwrap(), "eth0");
+            assert_eq!(pick_interface_in(&s1, &none).unwrap().name, "eth0");
 
             // Mac OS 9 under QEMU: br0 = eth0 + tap0, IP on Wi-Fi
             let s2 = base.join("qemu");
@@ -668,17 +770,36 @@ mod imp {
             fake_if(&s2, "tap0", &[], false);
             fake_if(&s2, "wlan0", &[], true);
             fake_if(&s2, "br0", &["eth0", "tap0"], false);
-            assert_eq!(pick_interface_in(&s2, &none).unwrap(), "br0");
+            let p = pick_interface_in(&s2, &none).unwrap();
+            assert_eq!(p.name, "br0");
             // even when eth0 is configured explicitly
             let eth = AppleTalkConfig { interface: Some("eth0".into()), ..none.clone() };
-            assert_eq!(pick_interface_in(&s2, &eth).unwrap(), "br0");
+            let p = pick_interface_in(&s2, &eth).unwrap();
+            assert_eq!(p.name, "br0");
+            assert_eq!(p.notes, vec!["eth0 is part of br0; using br0 instead".to_string()]);
 
             // only Wi-Fi: nothing suitable unless configured
             let s3 = base.join("wifi");
             fake_if(&s3, "wlan0", &[], true);
             assert!(pick_interface_in(&s3, &none).is_err());
             let w = AppleTalkConfig { interface: Some("wlan0".into()), ..none.clone() };
-            assert_eq!(pick_interface_in(&s3, &w).unwrap(), "wlan0");
+            assert_eq!(pick_interface_in(&s3, &w).unwrap().name, "wlan0");
+
+            // Pi on Wi-Fi with an unplugged eth0: eth0 is skipped...
+            let s4 = base.join("unplugged");
+            fake_if_link(&s4, "eth0", &[], false, false);
+            fake_if(&s4, "wlan0", &[], true);
+            let e = pick_interface_in(&s4, &none).err().expect("no usable interface").to_string();
+            assert!(e.contains("eth0 has none"), "{}", e);
+            // ...unless named explicitly, which works but is flagged
+            let p = pick_interface_in(&s4, &eth).unwrap();
+            assert_eq!((p.name.as_str(), p.no_link), ("eth0", true));
+            // a host-only bridge for a VM that is not running yet has no
+            // link either, and is still chosen
+            fake_if_link(&s4, "tap0", &[], false, false);
+            fake_if_link(&s4, "br0", &["tap0"], false, false);
+            let p = pick_interface_in(&s4, &none).unwrap();
+            assert_eq!((p.name.as_str(), p.no_link), ("br0", false));
             let _ = std::fs::remove_dir_all(&base);
         }
 
