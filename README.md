@@ -108,15 +108,19 @@ aware that those passwords cross the network in the clear.
 ```ini
 [Global]
 appletalk = yes
-ddp interface = eth0     ; default: the first wired Ethernet interface
 ```
 
-The kernel module `appletalk` is loaded automatically when the server opens
-its first AppleTalk socket (check with `lsmod | grep appletalk`). The server
-assumes a network without an AppleTalk router (the usual home setup): the
-Pi takes a node address in the startup range and appears as
-`<server name>:AFPServer@*`. AFP itself always runs over TCP/IP; Macs
-without TCP/IP configured cannot connect.
+afprustd picks the interface itself: a bridge if there is one (for example
+`br0` when Mac OS 9 runs under QEMU with bridged networking), otherwise
+`eth0`. The kernel module `appletalk` is loaded automatically when the
+server opens its first AppleTalk socket (check with `lsmod | grep
+appletalk`). The server assumes a network without an AppleTalk router (the
+usual home setup) and appears as `<server name>:AFPServer@*`. The Mac then
+connects over TCP/IP to the address in the log line
+`AppleTalk: advertising TCP/IP address …`. Macs without TCP/IP configured
+cannot connect. See the
+[configuration guide](docs/CONFIGURATION.md#appletalk) for details and QEMU
+setups.
 
 ## Configuration
 

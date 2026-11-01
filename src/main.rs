@@ -125,8 +125,7 @@ fn main() -> ExitCode {
     // helper process inherits no listening sockets.
     let mut helper = None;
     if cfg.global.appletalk.enabled {
-        let port = cfg.global.listen.first().map(|a| a.port()).unwrap_or(548);
-        match atalk::spawn(&cfg.global.appletalk, &master::server_info(&cfg), port) {
+        match atalk::spawn(&cfg.global.appletalk, &master::server_info(&cfg), &cfg.global.listen) {
             Ok(pid) => helper = Some(pid),
             Err(e) => log::error!("AppleTalk disabled: {}", e),
         }

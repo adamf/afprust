@@ -188,7 +188,7 @@ See [AppleTalk](#appletalk).
 | `extmap file` | `/etc/afprust/extmap.conf` | Extension → type/creator map. |
 | `mac charset` | `MAC_ROMAN` | Only MacRoman is supported. |
 | `appletalk` | `no` | Announce the server over AppleTalk. |
-| `ddp interface` | first wired Ethernet | Interface for AppleTalk. *(afprust)* |
+| `ddp interface` | a bridge with ports, else `eth0` | Interface for AppleTalk; bridge ports are replaced by their bridge. *(afprust)* |
 | `ddp address` | random | AppleTalk address as `net.node`, e.g. `65280.42`. |
 | `ddp zone` | none | AppleTalk zone to answer for. |
 | `vol preset` | none | Template section applied to every volume. |
@@ -329,15 +329,46 @@ uses TCP/IP, so the Mac needs TCP/IP configured as well. (AppleShare Client
 - The kernel module `appletalk` is loaded automatically. If start-up logs
   "kernel has no AppleTalk support", run `sudo modprobe appletalk` and check
   `lsmod | grep appletalk`.
-- `ddp interface` picks the interface. The default is the first wired
-  Ethernet interface (`eth0` on a Pi). Wi-Fi is skipped by default because
-  AppleTalk over Wi-Fi is unreliable. Set `ddp interface = wlan0` to try it.
+- `ddp interface` picks the interface. By default afprustd uses a bridge
+  that has ports (`br0`, libvirt's `virbr0`) if there is one, otherwise
+  `eth0`. Wi-Fi is skipped by default because AppleTalk over Wi-Fi is
+  unreliable; set `ddp interface = wlan0` to try it. tap, veth and Docker
+  interfaces are never chosen.
+- An interface that is part of a bridge (or bond) cannot receive AppleTalk
+  itself, because the kernel hands its traffic to the bridge. afprustd
+  therefore always moves to the bridge, even when `ddp interface` names a
+  port, and logs `eth0 is part of br0; using br0 instead`.
+- The Chooser learns from afprustd which IP address to connect to. That is,
+  in order: the specific addresses in `afp listen`, if any; otherwise the
+  AppleTalk interface's IPv4 address; otherwise the host's other IPv4
+  addresses (such as Wi-Fi). The log shows
+  `AppleTalk: advertising TCP/IP address …`. If the Macs should use a
+  different address, set `afp listen = <that address>` (afprustd then
+  listens only on that address). The list is
+  refreshed every 10 seconds, so addresses obtained after start-up (DHCP)
+  are picked up.
 - Designed for networks without an AppleTalk router (the usual home setup).
   If the interface already has an AppleTalk address, afprustd uses it, but
   netatalk's `atalkd` must not be running: it holds the name lookup (NBP)
   socket that afprustd needs.
 - Mac side: in the **AppleTalk** control panel, select Ethernet and make
   sure AppleTalk is active in the Chooser.
+
+### Mac OS 9 under QEMU
+
+A common setup runs Mac OS 9 in `qemu-system-ppc` on the same Pi or another
+Linux machine.
+
+- **Bridged networking** (a bridge such as `br0` holding `eth0` and the
+  VM's tap device, or libvirt's `virbr0`): the virtual Mac is on the same
+  Ethernet segment as the bridge. With `appletalk = yes`, afprustd runs
+  AppleTalk on the bridge automatically, so the server appears in the
+  virtual Mac's Chooser. Server IP Address works with the Pi's LAN address
+  as usual.
+- **User-mode networking** (`-netdev user`, QEMU's default): there is no
+  Ethernet segment, so AppleTalk cannot reach the virtual Mac. Use
+  **Server IP Address…** with `10.0.2.2`, QEMU's address for the host. This
+  only works when afprustd runs on the same machine as QEMU.
 
 ## Mac metadata storage
 
@@ -456,5 +487,6 @@ every failing AFP command.
 | A volume is missing from the list | `valid users`, `invalid users`, `hosts allow`/`deny`. Is the path absolute and free of `..` after variable expansion? `afprustd -t` shows the parsed volumes. |
 | "You do not have enough access privileges" | Unix permissions of the folder for that user (`sudo -u <user> ls <path>`). Home directories are often 0700. |
 | Files show generic icons / open in the wrong app | Finder info is missing: add the extension to `extmap.conf`, or set type/creator from the Mac. |
-| The server is not in the Chooser | `appletalk = yes`? Check `journalctl` for AppleTalk errors and `lsmod \| grep appletalk`. Is AppleTalk on Ethernet active on the Mac? Without AppleTalk, use **Server IP Address…**. |
+| The server is not in the Chooser | `appletalk = yes`, and did you `restart` (reload does not start AppleTalk)? Check `journalctl -u afprustd \| grep AppleTalk` for the interface and address, and `lsmod \| grep appletalk`. Is AppleTalk on Ethernet active on the Mac? With QEMU, see [Mac OS 9 under QEMU](#mac-os-9-under-qemu). Without AppleTalk, use **Server IP Address…**. |
+| The server is in the Chooser but will not connect | The log line `AppleTalk: advertising TCP/IP address …` must show an address the Mac can reach. Set `afp listen = <address>` to choose it. |
 | Changes are not picked up | `sudo systemctl reload afprustd` (address changes need `restart`). Connected Macs keep their session's view until they reconnect. |

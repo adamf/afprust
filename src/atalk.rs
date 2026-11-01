@@ -23,7 +23,8 @@ mod imp {
     use super::*;
     use crate::afp::status::{self, NetAddr};
     use std::io;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::Path;
 
     const AF_APPLETALK: libc::c_int = 5;
     const SIOCGIFADDR: libc::c_ulong = 0x8915;
@@ -99,27 +100,70 @@ mod imp {
     }
 
     fn pick_interface(cfg: &AppleTalkConfig) -> io::Result<String> {
-        if let Some(i) = &cfg.interface {
-            return Ok(i.clone());
+        pick_interface_in(Path::new("/sys/class/net"), cfg)
+    }
+
+    /// Interfaces that never carry the Macs' AppleTalk directly: VM and
+    /// container plumbing below a bridge, VPNs, Docker networks.
+    fn skip_for_appletalk(name: &str) -> bool {
+        name == "lo"
+            || ["docker", "br-", "veth", "tap", "vnet", "tun", "wg", "tailscale", "zt"].iter().any(|p| name.starts_with(p))
+    }
+
+    /// Choose the AppleTalk interface (sysfs root as a parameter for tests).
+    ///
+    /// A bridge port (or bond member) cannot receive AppleTalk itself: the
+    /// kernel hands its frames to the bridge. This is the usual setup for
+    /// Mac OS 9 under QEMU (br0 = eth0 + the VM's tap), so AppleTalk runs
+    /// on the bridge, where both the LAN and the virtual Mac are reachable.
+    fn pick_interface_in(sys: &Path, cfg: &AppleTalkConfig) -> io::Result<String> {
+        let mut name = match &cfg.interface {
+            Some(i) => i.clone(),
+            None => {
+                let mut cands: Vec<(u8, String)> = Vec::new();
+                for e in std::fs::read_dir(sys)?.flatten() {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    let p = e.path();
+                    let typ = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+                    if typ.trim() != "1" || skip_for_appletalk(&n) || p.join("wireless").exists() {
+                        continue;
+                    }
+                    let is_bridge = p.join("bridge").exists();
+                    let has_ports = std::fs::read_dir(p.join("brif")).map(|mut d| d.next().is_some()).unwrap_or(false);
+                    let prio = if is_bridge && has_ports {
+                        0
+                    } else if n == "eth0" || n == "end0" {
+                        1
+                    } else if is_bridge {
+                        3
+                    } else {
+                        2
+                    };
+                    cands.push((prio, n));
+                }
+                cands.sort();
+                cands
+                    .into_iter()
+                    .next()
+                    .map(|(_, n)| n)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no wired Ethernet interface found; set 'ddp interface'"))?
+            }
+        };
+        // Climb from a bridge port / bond member to the device that
+        // actually receives its traffic.
+        for _ in 0..4 {
+            let master = match std::fs::read_link(sys.join(&name).join("master")) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let m = match master.file_name() {
+                Some(m) => m.to_string_lossy().into_owned(),
+                None => break,
+            };
+            log::info!("AppleTalk: {} is part of {}; using {} instead", name, m, m);
+            name = m;
         }
-        let mut best: Option<String> = None;
-        for e in std::fs::read_dir("/sys/class/net")?.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let typ = std::fs::read_to_string(e.path().join("type")).unwrap_or_default();
-            if typ.trim() != "1" || name == "lo" {
-                continue;
-            }
-            if e.path().join("wireless").exists() {
-                continue;
-            }
-            if name == "eth0" || name == "end0" {
-                return Ok(name);
-            }
-            if best.is_none() {
-                best = Some(name);
-            }
-        }
-        best.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no wired Ethernet interface found; set 'ddp interface'"))
+        Ok(name)
     }
 
     fn random_u8() -> u8 {
@@ -340,8 +384,46 @@ mod imp {
         }
     }
 
+    /// Everything needed to rebuild the GetStatus reply when the host's
+    /// addresses change (DHCP after boot, Wi-Fi reconnects, ...).
+    struct StatusSource {
+        info: ServerInfo,
+        ifname: String,
+        listen: Vec<SocketAddr>,
+        ddp: NetAddr,
+        current: Vec<SocketAddr>,
+        refreshed: std::time::Instant,
+    }
+
+    impl StatusSource {
+        fn build(&mut self) -> Vec<u8> {
+            let ips = advertised_addrs(&interface_ipv4_all(), &self.ifname, &self.listen);
+            if ips != self.current || self.current.is_empty() {
+                if ips.is_empty() {
+                    log::warn!(
+                        "AppleTalk: no usable IPv4 address to advertise; Macs will find the server but cannot connect \
+                         (set 'afp listen' to the address Macs should use)"
+                    );
+                } else {
+                    let list: Vec<String> = ips.iter().map(|a| a.to_string()).collect();
+                    log::info!("AppleTalk: advertising TCP/IP address {}", list.join(", "));
+                }
+                self.current = ips.clone();
+            }
+            self.refreshed = std::time::Instant::now();
+            let mut addrs: Vec<NetAddr> = ips.into_iter().map(NetAddr::Ip).collect();
+            addrs.push(self.ddp.clone());
+            let mut info = self.info.clone();
+            // ATP responses carry at most 8 x 578 bytes.
+            if status::build(&info, &addrs).len() > 8 * ATP_MAX_DATA {
+                info.icon = None;
+            }
+            status::build(&info, &addrs)
+        }
+    }
+
     impl Responder {
-        fn run(&self) -> ! {
+        fn run(&mut self, mut src: StatusSource) -> ! {
             let mut buf = [0u8; 1024];
             loop {
                 if crate::signals::terminating() {
@@ -353,6 +435,9 @@ mod imp {
                 ];
                 // SAFETY: valid pollfd array.
                 let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 5000) };
+                if src.refreshed.elapsed() >= std::time::Duration::from_secs(10) {
+                    self.logic.status = src.build();
+                }
                 if r <= 0 {
                     continue;
                 }
@@ -374,7 +459,8 @@ mod imp {
         }
     }
 
-    fn interface_ipv4(ifname: &str) -> Vec<IpAddr> {
+    /// All IPv4 addresses on the host, with their interface names.
+    fn interface_ipv4_all() -> Vec<(String, Ipv4Addr)> {
         let mut out = Vec::new();
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         // SAFETY: getifaddrs allocates a list we free below.
@@ -386,16 +472,59 @@ mod imp {
             unsafe {
                 let ifa = &*p;
                 if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET {
-                    let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-                    if name == ifname {
-                        let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                        out.push(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
-                    }
+                    let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    out.push((name, Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
                 }
                 p = ifa.ifa_next;
             }
         }
         unsafe { libc::freeifaddrs(ifap) };
+        out
+    }
+
+    fn virtual_interface(name: &str) -> bool {
+        ["docker", "veth", "virbr", "br-", "vnet", "tailscale", "wg", "tun", "tap", "zt"]
+            .iter()
+            .any(|p| name.starts_with(p))
+    }
+
+    /// The TCP/IP addresses to put in the AppleTalk GetStatus reply, so a
+    /// Mac that found the server through the Chooser knows where to
+    /// connect:
+    ///
+    /// 1. specific IPv4 addresses from `afp listen`, if any;
+    /// 2. otherwise the IPv4 addresses of the AppleTalk interface;
+    /// 3. otherwise the host's other IPv4 addresses (e.g. Wi-Fi or a
+    ///    bridge), skipping loopback, link-local and virtual interfaces.
+    fn advertised_addrs(ifaces: &[(String, Ipv4Addr)], atalk_if: &str, listen: &[SocketAddr]) -> Vec<SocketAddr> {
+        let explicit: Vec<SocketAddr> = listen
+            .iter()
+            .filter(|a| match crate::config::normalize_ip(a.ip()) {
+                IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_loopback(),
+                IpAddr::V6(_) => false,
+            })
+            .map(|a| SocketAddr::new(crate::config::normalize_ip(a.ip()), a.port()))
+            .collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        let port = listen.first().map(|a| a.port()).unwrap_or(548);
+        let usable = |ip: &Ipv4Addr| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified();
+        let mut out: Vec<SocketAddr> = ifaces
+            .iter()
+            .filter(|(n, ip)| n == atalk_if && usable(ip))
+            .map(|(_, ip)| SocketAddr::new(IpAddr::V4(*ip), port))
+            .collect();
+        if out.is_empty() {
+            out = ifaces
+                .iter()
+                .filter(|(n, ip)| n != "lo" && !virtual_interface(n) && usable(ip))
+                .map(|(_, ip)| SocketAddr::new(IpAddr::V4(*ip), port))
+                .collect();
+        }
+        out.dedup();
+        out.truncate(4);
         out
     }
 
@@ -410,7 +539,7 @@ mod imp {
         }
     }
 
-    pub fn spawn(cfg: &AppleTalkConfig, info: &ServerInfo, tcp_port: u16) -> io::Result<libc::pid_t> {
+    pub fn spawn(cfg: &AppleTalkConfig, info: &ServerInfo, listen: &[SocketAddr]) -> io::Result<libc::pid_t> {
         let ifname = pick_interface(cfg)?;
         let ctl = ddp_socket()?;
         let (net, node) = configure(&ctl, &ifname, cfg)
@@ -419,21 +548,24 @@ mod imp {
         bind(&nbp, net, node, NBP_SOCKET).map_err(|e| io::Error::new(e.kind(), format!("cannot bind NBP socket: {}", e)))?;
         let atp = ddp_socket()?;
         let atp_port = bind(&atp, net, node, 0)?;
-        let mut addrs: Vec<NetAddr> = interface_ipv4(&ifname)
-            .into_iter()
-            .map(|ip| NetAddr::Ip(SocketAddr::new(ip, tcp_port)))
-            .collect();
-        if addrs.is_empty() {
-            log::warn!("AppleTalk: {} has no IPv4 address; Macs will not be able to connect over TCP", ifname);
-        }
-        addrs.push(NetAddr::Ddp { net, node, socket: atp_port });
-        let mut ainfo = info.clone();
-        // Keep the ASP status small: ATP responses carry at most 8 x 578 bytes.
-        if status::build(&ainfo, &addrs).len() > 8 * ATP_MAX_DATA {
-            ainfo.icon = None;
-        }
-        let status = status::build(&ainfo, &addrs);
-        let responder = Responder {
+        log::info!(
+            "AppleTalk: {} is {}.{}, registered {}:AFPServer@* on socket {}",
+            ifname,
+            net,
+            node,
+            crate::charset::macroman_decode(&info.name),
+            atp_port
+        );
+        let mut src = StatusSource {
+            info: info.clone(),
+            ifname: ifname.clone(),
+            listen: listen.to_vec(),
+            ddp: NetAddr::Ddp { net, node, socket: atp_port },
+            current: Vec::new(),
+            refreshed: std::time::Instant::now(),
+        };
+        let status = src.build();
+        let mut responder = Responder {
             nbp,
             atp,
             logic: Logic {
@@ -445,14 +577,6 @@ mod imp {
                 status,
             },
         };
-        log::info!(
-            "AppleTalk: {} is {}.{}, registered {}:AFPServer@* on socket {}",
-            ifname,
-            net,
-            node,
-            crate::charset::macroman_decode(&info.name),
-            atp_port
-        );
         drop(ctl);
         // SAFETY: called from the single-threaded master before it starts
         // serving.
@@ -465,7 +589,7 @@ mod imp {
             // Exit when the master goes away.
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
             drop_to_nobody();
-            responder.run();
+            responder.run(src);
         }
         Ok(pid)
     }
@@ -508,6 +632,81 @@ mod imp {
             }
         }
 
+        fn fake_if(sys: &Path, name: &str, bridge_ports: &[&str], wireless: bool) {
+            let d = sys.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("type"), "1\n").unwrap();
+            if wireless {
+                std::fs::create_dir_all(d.join("wireless")).unwrap();
+            }
+            if !bridge_ports.is_empty() {
+                std::fs::create_dir_all(d.join("bridge")).unwrap();
+                std::fs::create_dir_all(d.join("brif")).unwrap();
+                for p in bridge_ports {
+                    std::fs::write(d.join("brif").join(p), "").unwrap();
+                    std::os::unix::fs::symlink(format!("../{}", name), sys.join(p).join("master")).unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn interface_choice() {
+            let base = std::env::temp_dir().join(format!("afprust-sysfs-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let none = AppleTalkConfig { enabled: true, interface: None, address: None, zone: None };
+
+            // plain Pi: wired + Wi-Fi
+            let s1 = base.join("plain");
+            fake_if(&s1, "eth0", &[], false);
+            fake_if(&s1, "wlan0", &[], true);
+            fake_if(&s1, "docker0", &[], false);
+            assert_eq!(pick_interface_in(&s1, &none).unwrap(), "eth0");
+
+            // Mac OS 9 under QEMU: br0 = eth0 + tap0, IP on Wi-Fi
+            let s2 = base.join("qemu");
+            fake_if(&s2, "eth0", &[], false);
+            fake_if(&s2, "tap0", &[], false);
+            fake_if(&s2, "wlan0", &[], true);
+            fake_if(&s2, "br0", &["eth0", "tap0"], false);
+            assert_eq!(pick_interface_in(&s2, &none).unwrap(), "br0");
+            // even when eth0 is configured explicitly
+            let eth = AppleTalkConfig { interface: Some("eth0".into()), ..none.clone() };
+            assert_eq!(pick_interface_in(&s2, &eth).unwrap(), "br0");
+
+            // only Wi-Fi: nothing suitable unless configured
+            let s3 = base.join("wifi");
+            fake_if(&s3, "wlan0", &[], true);
+            assert!(pick_interface_in(&s3, &none).is_err());
+            let w = AppleTalkConfig { interface: Some("wlan0".into()), ..none.clone() };
+            assert_eq!(pick_interface_in(&s3, &w).unwrap(), "wlan0");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn advertised_addresses() {
+            let ifs = vec![
+                ("lo".to_string(), Ipv4Addr::new(127, 0, 0, 1)),
+                ("eth0".to_string(), Ipv4Addr::new(169, 254, 3, 4)),
+                ("docker0".to_string(), Ipv4Addr::new(172, 17, 0, 1)),
+                ("wlan0".to_string(), Ipv4Addr::new(192, 168, 1, 50)),
+            ];
+            let any: Vec<SocketAddr> = vec!["0.0.0.0:548".parse().unwrap()];
+            // eth0 has only a link-local address: fall back to Wi-Fi
+            assert_eq!(advertised_addrs(&ifs, "eth0", &any), vec!["192.168.1.50:548".parse().unwrap()]);
+            // eth0 with a real address wins
+            let mut with_eth = ifs.clone();
+            with_eth.push(("eth0".to_string(), Ipv4Addr::new(10, 0, 0, 2)));
+            assert_eq!(advertised_addrs(&with_eth, "eth0", &any), vec!["10.0.0.2:548".parse().unwrap()]);
+            // explicit afp listen address wins over everything
+            let listen: Vec<SocketAddr> = vec!["192.168.1.99:5480".parse().unwrap(), "[::]:5480".parse().unwrap()];
+            assert_eq!(advertised_addrs(&with_eth, "eth0", &listen), vec!["192.168.1.99:5480".parse().unwrap()]);
+            // the port of a wildcard listen address is used
+            let p: Vec<SocketAddr> = vec!["[::]:5480".parse().unwrap()];
+            assert_eq!(advertised_addrs(&with_eth, "eth0", &p), vec!["10.0.0.2:5480".parse().unwrap()]);
+            // nothing usable
+            assert!(advertised_addrs(&ifs[..3], "eth0", &any).is_empty());
+        }
+
         #[test]
         fn asp_get_status() {
             let l = logic();
@@ -532,11 +731,11 @@ mod imp {
 }
 
 #[cfg(target_os = "linux")]
-pub fn spawn(cfg: &AppleTalkConfig, info: &ServerInfo, tcp_port: u16) -> std::io::Result<libc::pid_t> {
-    imp::spawn(cfg, info, tcp_port)
+pub fn spawn(cfg: &AppleTalkConfig, info: &ServerInfo, listen: &[std::net::SocketAddr]) -> std::io::Result<libc::pid_t> {
+    imp::spawn(cfg, info, listen)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn spawn(_cfg: &AppleTalkConfig, _info: &ServerInfo, _tcp_port: u16) -> std::io::Result<libc::pid_t> {
+pub fn spawn(_cfg: &AppleTalkConfig, _info: &ServerInfo, _listen: &[std::net::SocketAddr]) -> std::io::Result<libc::pid_t> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "AppleTalk is only supported on Linux"))
 }
