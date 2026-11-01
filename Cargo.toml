@@ -34,6 +34,8 @@ strip = true
 [package.metadata.deb]
 name = "afprust"
 maintainer = "Adam Fletcher <adam@return.dev>"
+copyright = "2026, Adam Fletcher"
+license-file = ["LICENSE", "0"]
 section = "net"
 priority = "optional"
 depends = "$auto"
